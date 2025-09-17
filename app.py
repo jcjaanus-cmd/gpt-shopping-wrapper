@@ -1,4 +1,4 @@
-import os, math, datetime
+import os, math, datetime, json
 from flask import Flask, request, jsonify
 import requests
 from requests_aws4auth import AWS4Auth
@@ -18,7 +18,6 @@ app = Flask(__name__)
 
 # ---------- helpers ----------
 def g(obj, path, default=None):
-    """safe getter with path list"""
     cur = obj
     try:
         for k in path:
@@ -39,7 +38,6 @@ def normalize_item(item):
         brand  = g(item, ["ItemInfo","ByLineInfo","Brand","DisplayValue"])
         category = g(item, ["ItemInfo","Classifications","Binding","DisplayValue"])
 
-        # prices / availability
         listing = g(item, ["Offers","Listings",0], {})
         price_amt = g(listing, ["Price","Amount"])
         list_price_amt = g(listing, ["SavingBasis","Amount"])
@@ -57,22 +55,17 @@ def normalize_item(item):
         if del_min: del_min = str(del_min)[:10]
         if del_max: del_max = str(del_max)[:10]
 
-        # rating
         rating  = g(item, ["CustomerReviews","StarRating","DisplayValue"])
         reviews = g(item, ["CustomerReviews","Count"])
 
-        # images
         image   = g(item, ["Images","Primary","Large","URL"])
         variants = []
-        vlist = g(item, ["Images","Variants"], []) or []
-        for v in vlist:
+        for v in (g(item, ["Images","Variants"], []) or []):
             url = g(v, ["Large","URL"])
             if url: variants.append(url)
 
-        # features
         features = g(item, ["ItemInfo","Features","DisplayValues"], []) or []
 
-        # external ids
         upc = None
         ean = None
         upcs = g(item, ["ItemInfo","ExternalIds","UPCs","DisplayValues"])
@@ -122,20 +115,37 @@ def search_paapi(keywords, item_page, item_count, resources):
         "ItemCount": item_count,
         "Resources": resources
     }
-    r = requests.post(ENDPOINT_SEARCH, json=body, headers=headers, auth=auth, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    r = requests.post(ENDPOINT_SEARCH, json=body, headers=headers, auth=auth, timeout=15)
+    # If Amazon returns a JSON error payload with 400/401/403, surface it
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        err_text = r.text
+        try:
+            err_json = r.json()
+        except Exception:
+            err_json = None
+        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err_text if not err_json else json.dumps(err_json)}") from e
 
-    # Items can be under SearchResult.Items or ItemsResult.Items depending on docs/SDK
-    items = g(data, ["SearchResult","Items"])
-    if not items:
-        items = g(data, ["ItemsResult","Items"], [])
+    data = r.json()
+    # Surface per-call logical errors (Errors array) if they exist
+    if "Errors" in data and data["Errors"]:
+        raise RuntimeError(f"PA-API Errors: {json.dumps(data['Errors'])}")
+
+    items = g(data, ["SearchResult","Items"]) or g(data, ["ItemsResult","Items"], [])
     return items or []
 
 # ---------- routes ----------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time": datetime.datetime.utcnow().isoformat() + "Z"})
+    return jsonify({
+        "ok": True,
+        "time": datetime.datetime.utcnow().isoformat() + "Z",
+        "env_ok": bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG),
+        "host": AMAZON_HOST,
+        "region": AMAZON_REGION,
+        "marketplace": AMAZON_MARKETPLACE
+    })
 
 @app.get("/search")
 def search():
@@ -147,11 +157,11 @@ def search():
         return jsonify({"error":"Missing required query param 'q'"}), 400
 
     def _float(name):
-        v = request.args.get(name); 
+        v = request.args.get(name)
         try: return float(v) if v else None
         except: return None
     def _int(name, default):
-        v = request.args.get(name); 
+        v = request.args.get(name)
         try: return int(v) if v else default
         except: return default
     def _bool(name):
@@ -177,18 +187,20 @@ def search():
     ]
 
     results = []
+    errors = []
     for page in range(1, pages+1):
         try:
             items = search_paapi(q, page, 10, resources)
         except Exception as e:
+            errors.append(str(e))
             break
         if not items:
             break
         for raw in items:
             norm = normalize_item(raw)
-            if not norm: 
+            if not norm:
                 continue
-            if max_price is not None and norm["price"] is not None and norm["price"] > max_price:
+            if (max_price is not None) and (norm["price"] is not None) and (norm["price"] > max_price):
                 continue
             if prime_only and norm["is_prime"] is not True:
                 continue
@@ -207,25 +219,23 @@ def search():
 
     results_sorted = sorted(results, key=score, reverse=True)
 
-    return jsonify({
+    payload = {
         "criteria": {"q": q, "max_price": max_price, "prime_only": prime_only, "pages": pages},
         "timestamp": ts,
         "products": results_sorted
-    })
+    }
+    if errors:
+        payload["errors"] = errors
+    status = 200 if results_sorted else (502 if errors else 200)
+    return jsonify(payload), status
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
-@app.route("/debug-search")
+@app.get("/debug-search")
 def debug_search():
     q = request.args.get("q", "headphones")
     try:
-        products = search_amazon_products(q)
-        return jsonify({"ok": True, "q": q, "count": len(products), "products": products})
+        items = search_paapi(q, 1, 10, [
+            "ItemInfo.Title", "Offers.Listings.Price"
+        ])
+        return jsonify({"ok": True, "q": q, "count": len(items), "items_raw_keys": list(items[0].keys()) if items else []})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
+        return jsonify({"ok": False, "error": str(e)}), 502
