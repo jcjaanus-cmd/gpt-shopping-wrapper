@@ -103,9 +103,16 @@ def normalize_item(item):
     except Exception:
         return None
 
+# ---------- main Amazon search ----------
 def search_paapi(keywords, item_page, item_count, resources):
     auth = AWS4Auth(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_REGION, SERVICE)
-    headers = {"Content-Type":"application/json; charset=UTF-8", "Accept":"application/json"}
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json",
+        # Required by PA-API v5:
+        "Content-Encoding": "amz-1.0",
+        "X-Amz-Target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems",
+    }
     body = {
         "PartnerTag": AMAZON_PARTNER_TAG,
         "PartnerType": "Associates",
@@ -113,22 +120,20 @@ def search_paapi(keywords, item_page, item_count, resources):
         "Keywords": keywords,
         "ItemPage": item_page,
         "ItemCount": item_count,
-        "Resources": resources
+        "Resources": resources,
     }
     r = requests.post(ENDPOINT_SEARCH, json=body, headers=headers, auth=auth, timeout=15)
-    # If Amazon returns a JSON error payload with 400/401/403, surface it
+
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
-        err_text = r.text
         try:
             err_json = r.json()
         except Exception:
-            err_json = None
-        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err_text if not err_json else json.dumps(err_json)}") from e
+            err_json = r.text
+        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err_json}") from e
 
     data = r.json()
-    # Surface per-call logical errors (Errors array) if they exist
     if "Errors" in data and data["Errors"]:
         raise RuntimeError(f"PA-API Errors: {json.dumps(data['Errors'])}")
 
@@ -236,6 +241,11 @@ def debug_search():
         items = search_paapi(q, 1, 10, [
             "ItemInfo.Title", "Offers.Listings.Price"
         ])
-        return jsonify({"ok": True, "q": q, "count": len(items), "items_raw_keys": list(items[0].keys()) if items else []})
+        return jsonify({"ok": True, "q": q, "count": len(items)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
+
+# Run locally
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
