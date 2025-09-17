@@ -215,3 +215,17 @@ def search():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
+@app.route("/debug-search")
+def debug_search():
+    q = request.args.get("q", "headphones")
+    try:
+        products = search_amazon_products(q)
+        return jsonify({"ok": True, "q": q, "count": len(products), "products": products})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
