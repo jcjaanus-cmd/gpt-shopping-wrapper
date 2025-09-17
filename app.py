@@ -1,12 +1,12 @@
-import os, math, datetime, json
+import os, math, datetime, json, time, threading, random
 from flask import Flask, request, jsonify
 import requests
 from requests_aws4auth import AWS4Auth
 
-# ========== ENV VARS ==========
+# ========= ENV =========
 AMAZON_ACCESS_KEY   = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY   = os.getenv("AMAZON_SECRET_KEY")
-AMAZON_PARTNER_TAG  = os.getenv("AMAZON_PARTNER_TAG")      # e.g., yourtag-20
+AMAZON_PARTNER_TAG  = os.getenv("AMAZON_PARTNER_TAG")          # e.g., yourtag-20
 AMAZON_HOST         = os.getenv("AMAZON_HOST", "webservices.amazon.com")
 AMAZON_REGION       = os.getenv("AMAZON_REGION", "us-east-1")
 AMAZON_MARKETPLACE  = os.getenv("AMAZON_MARKETPLACE", "www.amazon.com")
@@ -14,9 +14,13 @@ AMAZON_MARKETPLACE  = os.getenv("AMAZON_MARKETPLACE", "www.amazon.com")
 SERVICE             = "ProductAdvertisingAPI"
 ENDPOINT_SEARCH     = f"https://{AMAZON_HOST}/paapi5/searchitems"
 
+# knobs
+CACHE_TTL_SECONDS   = int(os.getenv("CACHE_TTL_SECONDS", "180"))   # page cache
+MIN_CALL_INTERVAL   = float(os.getenv("MIN_CALL_INTERVAL", "1.1")) # seconds between PA-API calls
+
 app = Flask(__name__)
 
-# ---------- helpers ----------
+# ========= helpers =========
 def g(obj, path, default=None):
     cur = obj
     try:
@@ -103,16 +107,54 @@ def normalize_item(item):
     except Exception:
         return None
 
-# ---------- main Amazon search ----------
-def search_paapi(keywords, item_page, item_count, resources):
-    auth = AWS4Auth(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_REGION, SERVICE)
-    headers = {
+# ========= tiny in-memory cache =========
+_cache = {}
+_cache_lock = threading.Lock()
+
+def cache_get(key):
+    with _cache_lock:
+        item = _cache.get(key)
+        if not item:
+            return None
+        exp, data = item
+        if time.time() > exp:
+            try: del _cache[key]
+            except: pass
+            return None
+        return data
+
+def cache_set(key, data, ttl=CACHE_TTL_SECONDS):
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, data)
+
+# ========= simple process-wide rate limiter =========
+_rate_lock = threading.Lock()
+_last_call_ts = 0.0
+
+def _rate_limit():
+    global _last_call_ts
+    with _rate_lock:
+        now = time.time()
+        wait = MIN_CALL_INTERVAL - (now - _last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts = time.time()
+
+def _paapi_headers():
+    # Required by PA-API v5 + JSON POST
+    return {
         "Content-Type": "application/json; charset=UTF-8",
         "Accept": "application/json",
-        # Required by PA-API v5:
         "Content-Encoding": "amz-1.0",
         "X-Amz-Target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems",
     }
+
+# ========= PA-API call with retries & backoff =========
+def search_paapi(keywords, item_page, item_count, resources):
+    if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
+        raise RuntimeError("Missing Amazon credentials env vars")
+
+    auth = AWS4Auth(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_REGION, SERVICE)
     body = {
         "PartnerTag": AMAZON_PARTNER_TAG,
         "PartnerType": "Associates",
@@ -122,35 +164,70 @@ def search_paapi(keywords, item_page, item_count, resources):
         "ItemCount": item_count,
         "Resources": resources,
     }
-    r = requests.post(ENDPOINT_SEARCH, json=body, headers=headers, auth=auth, timeout=15)
 
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
+    max_retries = 5
+    backoff = 1.2
+    last_resp = None
+
+    for _ in range(max_retries):
+        _rate_limit()
+        last_resp = r = requests.post(
+            ENDPOINT_SEARCH, json=body, headers=_paapi_headers(),
+            auth=auth, timeout=15
+        )
+
+        # Success
+        if 200 <= r.status_code < 300:
+            data = r.json()
+            if data.get("Errors"):
+                raise RuntimeError(f"PA-API Errors: {json.dumps(data['Errors'])}")
+            items = g(data, ["SearchResult","Items"]) or g(data, ["ItemsResult","Items"], [])
+            return items or []
+
+        # Retryable
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(backoff + random.uniform(0, 0.3))  # jitter
+            backoff *= 1.7
+            continue
+
+        # Non-retryable → surface body
         try:
-            err_json = r.json()
+            err = r.json()
         except Exception:
-            err_json = r.text
-        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err_json}") from e
+            err = r.text
+        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err}")
 
-    data = r.json()
-    if "Errors" in data and data["Errors"]:
-        raise RuntimeError(f"PA-API Errors: {json.dumps(data['Errors'])}")
+    # Exhausted retries
+    try:
+        err = last_resp.json()
+    except Exception:
+        err = last_resp.text if last_resp is not None else "no response"
+    raise RuntimeError(f"PA-API HTTP {last_resp.status_code if last_resp else '???'} after retries: {err}")
 
-    items = g(data, ["SearchResult","Items"]) or g(data, ["ItemsResult","Items"], [])
-    return items or []
-
-# ---------- routes ----------
+# ========= routes =========
 @app.get("/health")
 def health():
     return jsonify({
         "ok": True,
         "time": datetime.datetime.utcnow().isoformat() + "Z",
         "env_ok": bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG),
-        "host": AMAZON_HOST,
-        "region": AMAZON_REGION,
-        "marketplace": AMAZON_MARKETPLACE
+        "host": AMAZON_HOST, "region": AMAZON_REGION, "marketplace": AMAZON_MARKETPLACE
     })
+
+@app.get("/cache-stats")
+def cache_stats():
+    with _cache_lock:
+        size = len(_cache)
+    return jsonify({"entries": size, "ttl_seconds": CACHE_TTL_SECONDS})
+
+@app.get("/debug-search")
+def debug_search():
+    q = request.args.get("q", "headphones")
+    try:
+        items = search_paapi(q, 1, 10, ["ItemInfo.Title", "Offers.Listings.Price"])
+        return jsonify({"ok": True, "q": q, "count": len(items)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 @app.get("/search")
 def search():
@@ -174,7 +251,7 @@ def search():
         return True if v in ("1","true","yes","y") else False
 
     max_price  = _float("max_price")
-    pages      = max(1, min(_int("pages", 2), 10))
+    pages      = max(1, min(_int("pages", 1), 5))   # be kind to PA-API
     prime_only = _bool("prime_only")
 
     resources = [
@@ -193,23 +270,32 @@ def search():
 
     results = []
     errors = []
+
     for page in range(1, pages+1):
+        cache_key = ("search", q, page)
+        data = cache_get(cache_key)
         try:
-            items = search_paapi(q, page, 10, resources)
+            if data is None:
+                raw_items = search_paapi(q, page, 10, resources)
+                # normalize once, then cache
+                normalized = [normalize_item(it) for it in raw_items if normalize_item(it)]
+                cache_set(cache_key, normalized)
+            else:
+                normalized = data
         except Exception as e:
             errors.append(str(e))
             break
-        if not items:
-            break
-        for raw in items:
-            norm = normalize_item(raw)
-            if not norm:
+
+        # filters
+        for p in normalized:
+            if (max_price is not None) and (p["price"] is not None) and (p["price"] > max_price):
                 continue
-            if (max_price is not None) and (norm["price"] is not None) and (norm["price"] > max_price):
+            if prime_only and p["is_prime"] is not True:
                 continue
-            if prime_only and norm["is_prime"] is not True:
-                continue
-            results.append(norm)
+            results.append(p)
+
+        # extra tiny pause between pages
+        time.sleep(0.2)
 
     ts = datetime.datetime.utcnow().isoformat() + "Z"
 
@@ -231,21 +317,10 @@ def search():
     }
     if errors:
         payload["errors"] = errors
+
     status = 200 if results_sorted else (502 if errors else 200)
     return jsonify(payload), status
 
-@app.get("/debug-search")
-def debug_search():
-    q = request.args.get("q", "headphones")
-    try:
-        items = search_paapi(q, 1, 10, [
-            "ItemInfo.Title", "Offers.Listings.Price"
-        ])
-        return jsonify({"ok": True, "q": q, "count": len(items)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-# Run locally
+# local run
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
