@@ -166,7 +166,7 @@ def _normalize_rainforest_item(r):
         "affiliate_url": r.get("link"),
     }
 
-def search_rainforest(q, page=1):
+def search_rainforest(q, page=1, num=10):
     api_key = os.getenv("RAINFOREST_API_KEY")
     if not api_key:
         raise RuntimeError("Missing RAINFOREST_API_KEY")
@@ -184,7 +184,11 @@ def search_rainforest(q, page=1):
     r.raise_for_status()
     data = r.json()
     items = data.get("search_results") or []
-    return [_normalize_rainforest_item(it) for it in items]
+    out = []
+    for it in items[:num]:
+        norm = _normalize_rainforest_item(it)
+        if norm: out.append(norm)
+    return out
 
 # ========= routes =========
 @app.get("/health")
@@ -216,73 +220,79 @@ def search():
         v = (request.args.get(name) or "").lower().strip()
         return True if v in ("1","true","yes","y") else False
 
-    min_price  = _float("min_price")
     max_price  = _float("max_price")
-    min_rating = _float("min_rating")
-    brand      = (request.args.get("brand") or "").lower()
+    pages      = max(1, min(_int("pages", 1), 5))   # default 1 page
     prime_only = _bool("prime_only")
-    pages      = max(1, min(_int("pages", 5), 5))   # up to 5 pages
 
-    results, errors = [], []
+    resources = [
+        "Images.Primary.Large","Images.Variants.Large",
+        "ItemInfo.Title","ItemInfo.Features","ItemInfo.ByLineInfo",
+        "ItemInfo.ProductInfo","ItemInfo.Classifications","ItemInfo.ExternalIds",
+        "Offers.Listings.Price","Offers.Listings.SavingBasis","Offers.Listings.Savings",
+        "Offers.Listings.MerchantInfo",
+        "Offers.Listings.DeliveryInfo.IsPrimeEligible",
+        "Offers.Listings.DeliveryInfo.IsFreeShippingEligible",
+        "Offers.Listings.Availability.Message",
+        "CustomerReviews.Count","CustomerReviews.StarRating"
+    ]
+
+    results = []
+    errors = []
 
     try:
         if provider == "rainforest":
-            for p in range(1, pages+1):
-                batch = search_rainforest(q, page=p)
-                results.extend(batch)
-                time.sleep(0.2)
+            # light: only page 1, ~10 items
+            results = search_rainforest(q, page=1, num=10)
         else:
-            resources = [
-                "Images.Primary.Large","Images.Variants.Large",
-                "ItemInfo.Title","ItemInfo.Features","ItemInfo.ByLineInfo",
-                "ItemInfo.ProductInfo","ItemInfo.Classifications","ItemInfo.ExternalIds",
-                "Offers.Listings.Price","Offers.Listings.SavingBasis","Offers.Listings.Savings",
-                "Offers.Listings.MerchantInfo",
-                "Offers.Listings.DeliveryInfo.IsPrimeEligible",
-                "Offers.Listings.DeliveryInfo.IsFreeShippingEligible",
-                "Offers.Listings.Availability.Message",
-                "CustomerReviews.Count","CustomerReviews.StarRating"
-            ]
-            for p in range(1, pages+1):
-                cache_key = ("search", q, p)
+            if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
+                return jsonify({"error":"Missing Amazon credentials env vars"}), 500
+
+            for page in range(1, pages+1):
+                cache_key = ("search", q, page)
                 cached = cache_get(cache_key)
                 if cached is None:
-                    raw = search_paapi(q, p, 10, resources)
+                    raw = search_paapi(q, page, 10, resources)
                     normalized = [normalize_item(it) for it in raw if normalize_item(it)]
                     cache_set(cache_key, normalized)
                 else:
                     normalized = cached
-                results.extend(normalized)
+
+                # simple filters (Amazon path only)
+                for p in normalized:
+                    if (max_price is not None) and (p["price"] is not None) and (p["price"] > max_price):
+                        continue
+                    if prime_only and p["is_prime"] is not True:
+                        continue
+                    results.append(p)
+
                 time.sleep(0.2)
     except Exception as e:
         errors.append(str(e))
 
-    # apply filters
-    filtered = []
-    for item in results:
-        price = item.get("price")
-        rating = item.get("rating")
-        if min_price is not None and (price is None or price < min_price): continue
-        if max_price is not None and (price is None or price > max_price): continue
-        if min_rating is not None and (rating is None or rating < min_rating): continue
-        if brand and (not item.get("brand") or brand not in item["brand"].lower()): continue
-        if prime_only and item.get("is_prime") is not True: continue
-        filtered.append(item)
+    ts = datetime.datetime.utcnow().isoformat() + "Z"
+
+    # light scoring (kept for backwards compatibility)
+    def score(p):
+        r = (p.get("rating") or 0.0)
+        v = math.log10((p.get("review_count") or 0) + 1.0)
+        price_fit = 0.0
+        if max_price and p.get("price"):
+            price_fit = 1.0 - min(1.0, max(0.0, (p["price"]/max_price)))
+        prime_bonus = 0.2 if p.get("is_prime") else 0.0
+        return (r*2.0) + v + price_fit + prime_bonus
+
+    results_sorted = sorted(results, key=score, reverse=True)
 
     payload = {
-        "criteria": {
-            "q": q, "provider": provider, "pages": pages,
-            "min_price": min_price, "max_price": max_price,
-            "min_rating": min_rating, "brand": brand,
-            "prime_only": prime_only
-        },
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "products": filtered[:50]   # cap at 50 for performance
+        "criteria": {"q": q, "provider": provider, "max_price": max_price, "prime_only": prime_only, "pages": pages},
+        "timestamp": ts,
+        "products": results_sorted[:50]  # cap at 50
     }
     if errors:
         payload["errors"] = errors
 
-    return jsonify(payload)
+    status = 200 if results_sorted else (502 if errors else 200)
+    return jsonify(payload), status
 
 # local run
 if __name__ == "__main__":
