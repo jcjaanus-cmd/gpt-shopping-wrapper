@@ -1,4 +1,4 @@
-import os, math, datetime, json, time, threading, random
+import os, datetime, time, threading, random, math, json
 from flask import Flask, request, jsonify
 import requests
 from requests_aws4auth import AWS4Auth
@@ -6,18 +6,17 @@ from requests_aws4auth import AWS4Auth
 # ========= ENV =========
 AMAZON_ACCESS_KEY   = os.getenv("AMAZON_ACCESS_KEY")
 AMAZON_SECRET_KEY   = os.getenv("AMAZON_SECRET_KEY")
-AMAZON_PARTNER_TAG  = os.getenv("AMAZON_PARTNER_TAG")          # e.g., yourtag-20
+AMAZON_PARTNER_TAG  = os.getenv("AMAZON_PARTNER_TAG")
 AMAZON_HOST         = os.getenv("AMAZON_HOST", "webservices.amazon.com")
 AMAZON_REGION       = os.getenv("AMAZON_REGION", "us-east-1")
 AMAZON_MARKETPLACE  = os.getenv("AMAZON_MARKETPLACE", "www.amazon.com")
-AMAZON_DOMAIN       = os.getenv("AMAZON_DOMAIN", "amazon.com") # for Rainforest/SerpApi style providers
+AMAZON_DOMAIN       = os.getenv("AMAZON_DOMAIN", "amazon.com")
 
 SERVICE             = "ProductAdvertisingAPI"
 ENDPOINT_SEARCH     = f"https://{AMAZON_HOST}/paapi5/searchitems"
 
-# knobs
-CACHE_TTL_SECONDS   = int(os.getenv("CACHE_TTL_SECONDS", "180"))   # page cache
-MIN_CALL_INTERVAL   = float(os.getenv("MIN_CALL_INTERVAL", "1.1")) # seconds between PA-API calls
+CACHE_TTL_SECONDS   = int(os.getenv("CACHE_TTL_SECONDS", "180"))
+MIN_CALL_INTERVAL   = float(os.getenv("MIN_CALL_INTERVAL", "1.1"))
 
 app = Flask(__name__)
 
@@ -46,19 +45,10 @@ def normalize_item(item):
         listing = g(item, ["Offers","Listings",0], {})
         price_amt = g(listing, ["Price","Amount"])
         list_price_amt = g(listing, ["SavingBasis","Amount"])
-        savings_amt = savings_pct = None
-        if price_amt is not None and list_price_amt:
-            savings_amt = max(0.0, list_price_amt - price_amt)
-            if list_price_amt > 0:
-                savings_pct = round(100.0 * savings_amt / list_price_amt)
 
         stock_msg = g(listing, ["Availability","Message"])
         is_prime  = g(listing, ["DeliveryInfo","IsPrimeEligible"])
         is_free   = g(listing, ["DeliveryInfo","IsFreeShippingEligible"])
-        del_min   = g(listing, ["DeliveryInfo","MinDeliveryDate"])
-        del_max   = g(listing, ["DeliveryInfo","MaxDeliveryDate"])
-        if del_min: del_min = str(del_min)[:10]
-        if del_max: del_max = str(del_max)[:10]
 
         rating  = g(item, ["CustomerReviews","StarRating","DisplayValue"])
         reviews = g(item, ["CustomerReviews","Count"])
@@ -71,13 +61,6 @@ def normalize_item(item):
 
         features = g(item, ["ItemInfo","Features","DisplayValues"], []) or []
 
-        upc = None
-        ean = None
-        upcs = g(item, ["ItemInfo","ExternalIds","UPCs","DisplayValues"])
-        eans = g(item, ["ItemInfo","ExternalIds","EANs","DisplayValues"])
-        if upcs: upc = upcs[0]
-        if eans: ean = eans[0]
-
         link = item.get("DetailPageURL")
 
         return {
@@ -88,27 +71,20 @@ def normalize_item(item):
             "category": category,
             "price": price_amt,
             "currency": "USD",
-            "list_price": list_price_amt,
-            "savings_amount": savings_amt,
-            "savings_percent": savings_pct,
             "rating": rating,
             "review_count": reviews,
             "stock_message": stock_msg,
             "is_prime": is_prime,
             "is_free_shipping": is_free,
-            "is_fulfilled_by_amazon": g(listing, ["MerchantInfo","IsFulfilledByAmazon"]),
-            "delivery_min": del_min,
-            "delivery_max": del_max,
             "features": features[:6],
             "image": image,
             "images": variants[:5],
-            "external_ids": {"upc": upc, "ean": ean},
             "affiliate_url": link
         }
     except Exception:
         return None
 
-# ========= tiny in-memory cache =========
+# ========= cache & rate limiting =========
 _cache = {}
 _cache_lock = threading.Lock()
 
@@ -128,7 +104,6 @@ def cache_set(key, data, ttl=CACHE_TTL_SECONDS):
     with _cache_lock:
         _cache[key] = (time.time() + ttl, data)
 
-# ========= simple process-wide rate limiter =========
 _rate_lock = threading.Lock()
 _last_call_ts = 0.0
 
@@ -142,7 +117,6 @@ def _rate_limit():
         _last_call_ts = time.time()
 
 def _paapi_headers():
-    # Required by PA-API v5 + JSON POST
     return {
         "Content-Type": "application/json; charset=UTF-8",
         "Accept": "application/json",
@@ -150,7 +124,7 @@ def _paapi_headers():
         "X-Amz-Target": "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems",
     }
 
-# ========= PA-API call with retries & backoff =========
+# ========= Amazon PA-API =========
 def search_paapi(keywords, item_page, item_count, resources):
     if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
         raise RuntimeError("Missing Amazon credentials env vars")
@@ -166,46 +140,15 @@ def search_paapi(keywords, item_page, item_count, resources):
         "Resources": resources,
     }
 
-    max_retries = 5
-    backoff = 1.2
-    last_resp = None
+    _rate_limit()
+    r = requests.post(ENDPOINT_SEARCH, json=body, headers=_paapi_headers(),
+                      auth=auth, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    items = g(data, ["SearchResult","Items"]) or g(data, ["ItemsResult","Items"], [])
+    return items or []
 
-    for _ in range(max_retries):
-        _rate_limit()
-        last_resp = r = requests.post(
-            ENDPOINT_SEARCH, json=body, headers=_paapi_headers(),
-            auth=auth, timeout=15
-        )
-
-        # Success
-        if 200 <= r.status_code < 300:
-            data = r.json()
-            if data.get("Errors"):
-                raise RuntimeError(f"PA-API Errors: {json.dumps(data['Errors'])}")
-            items = g(data, ["SearchResult","Items"]) or g(data, ["ItemsResult","Items"], [])
-            return items or []
-
-        # Retryable
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(backoff + random.uniform(0, 0.3))  # jitter
-            backoff *= 1.7
-            continue
-
-        # Non-retryable → surface body
-        try:
-            err = r.json()
-        except Exception:
-            err = r.text
-        raise RuntimeError(f"PA-API HTTP {r.status_code}: {err}")
-
-    # Exhausted retries
-    try:
-        err = last_resp.json()
-    except Exception:
-        err = last_resp.text if last_resp is not None else "no response"
-    raise RuntimeError(f"PA-API HTTP {last_resp.status_code if last_resp else '???'} after retries: {err}")
-
-# ========= Rainforest (paid search API; no AWS signing) =========
+# ========= Rainforest =========
 def _normalize_rainforest_item(r):
     price = g(r, ["price", "value"])
     currency = g(r, ["price", "currency"]) or "USD"
@@ -217,35 +160,22 @@ def _normalize_rainforest_item(r):
         "category": None,
         "price": float(price) if price is not None else None,
         "currency": currency,
-        "list_price": None,
-        "savings_amount": None,
-        "savings_percent": None,
         "rating": g(r, ["rating"]),
         "review_count": g(r, ["ratings_total"]),
-        "stock_message": None,
-        "is_prime": None,
-        "is_free_shipping": None,
-        "is_fulfilled_by_amazon": None,
-        "delivery_min": None,
-        "delivery_max": None,
-        "features": [],
         "image": r.get("image"),
-        "images": [],
-        "external_ids": {},
         "affiliate_url": r.get("link"),
     }
 
-def search_rainforest(q, page=1, num=10):
+def search_rainforest(q, page=1):
     api_key = os.getenv("RAINFOREST_API_KEY")
     if not api_key:
         raise RuntimeError("Missing RAINFOREST_API_KEY")
-    domain = AMAZON_DOMAIN
     r = requests.get(
         "https://api.rainforestapi.com/request",
         params={
             "api_key": api_key,
             "type": "search",
-            "amazon_domain": domain,
+            "amazon_domain": AMAZON_DOMAIN,
             "search_term": q,
             "page": page
         },
@@ -254,11 +184,7 @@ def search_rainforest(q, page=1, num=10):
     r.raise_for_status()
     data = r.json()
     items = data.get("search_results") or []
-    out = []
-    for it in items[:num]:
-        norm = _normalize_rainforest_item(it)
-        if norm: out.append(norm)
-    return out
+    return [_normalize_rainforest_item(it) for it in items]
 
 # ========= routes =========
 @app.get("/health")
@@ -266,25 +192,9 @@ def health():
     return jsonify({
         "ok": True,
         "time": datetime.datetime.utcnow().isoformat() + "Z",
-        "env_ok": bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG),
-        "host": AMAZON_HOST, "region": AMAZON_REGION, "marketplace": AMAZON_MARKETPLACE,
-        "has_rainforest_key": bool(os.getenv("RAINFOREST_API_KEY"))
+        "has_amazon": bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG),
+        "has_rainforest": bool(os.getenv("RAINFOREST_API_KEY")),
     })
-
-@app.get("/cache-stats")
-def cache_stats():
-    with _cache_lock:
-        size = len(_cache)
-    return jsonify({"entries": size, "ttl_seconds": CACHE_TTL_SECONDS})
-
-@app.get("/debug-search")
-def debug_search():
-    q = request.args.get("q", "headphones")
-    try:
-        items = search_paapi(q, 1, 10, ["ItemInfo.Title", "Offers.Listings.Price"])
-        return jsonify({"ok": True, "q": q, "count": len(items)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
 
 @app.get("/search")
 def search():
@@ -292,11 +202,10 @@ def search():
     if not q:
         return jsonify({"error":"Missing required query param 'q'"}), 400
 
-    # choose provider (default = amazon)
-    provider = (request.args.get("provider") or "amazon").lower()
+    provider = (request.args.get("provider") or "rainforest").lower()
 
-    def _float(name):
-        v = request.args.get(name)
+    def _float(name): 
+        v = request.args.get(name); 
         try: return float(v) if v else None
         except: return None
     def _int(name, default):
@@ -307,90 +216,73 @@ def search():
         v = (request.args.get(name) or "").lower().strip()
         return True if v in ("1","true","yes","y") else False
 
+    min_price  = _float("min_price")
     max_price  = _float("max_price")
-    pages      = max(1, min(_int("pages", 1), 5))   # be kind to PA-API
+    min_rating = _float("min_rating")
+    brand      = (request.args.get("brand") or "").lower()
     prime_only = _bool("prime_only")
+    pages      = max(1, min(_int("pages", 5), 5))   # up to 5 pages
 
-    resources = [
-        "Images.Primary.Large","Images.Variants.Large",
-        "ItemInfo.Title","ItemInfo.Features","ItemInfo.ByLineInfo",
-        "ItemInfo.ProductInfo","ItemInfo.Classifications","ItemInfo.ExternalIds",
-        "Offers.Listings.Price","Offers.Listings.SavingBasis","Offers.Listings.Savings",
-        "Offers.Listings.MerchantInfo",
-        "Offers.Listings.DeliveryInfo.IsPrimeEligible",
-        "Offers.Listings.DeliveryInfo.IsFreeShippingEligible",
-        "Offers.Listings.DeliveryInfo.MinDeliveryDate",
-        "Offers.Listings.DeliveryInfo.MaxDeliveryDate",
-        "Offers.Listings.Availability.Message",
-        "CustomerReviews.Count","CustomerReviews.StarRating"
-    ]
+    results, errors = [], []
 
-    results = []
-    errors = []
-
-    if provider == "rainforest":
-        # Rainforest path (no Amazon creds required)
-        try:
-            results = search_rainforest(q, page=1, num=10)
-        except Exception as e:
-            errors.append(f"rainforest: {e}")
-    else:
-        # Amazon path (requires Amazon env)
-        if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
-            return jsonify({"error":"Missing Amazon credentials env vars"}), 500
-
-        for page in range(1, pages+1):
-            cache_key = ("search", q, page)
-            data = cache_get(cache_key)
-            try:
-                if data is None:
-                    raw_items = search_paapi(q, page, 10, resources)
-                    # normalize once, then cache
-                    normalized = [normalize_item(it) for it in raw_items if normalize_item(it)]
+    try:
+        if provider == "rainforest":
+            for p in range(1, pages+1):
+                batch = search_rainforest(q, page=p)
+                results.extend(batch)
+                time.sleep(0.2)
+        else:
+            resources = [
+                "Images.Primary.Large","Images.Variants.Large",
+                "ItemInfo.Title","ItemInfo.Features","ItemInfo.ByLineInfo",
+                "ItemInfo.ProductInfo","ItemInfo.Classifications","ItemInfo.ExternalIds",
+                "Offers.Listings.Price","Offers.Listings.SavingBasis","Offers.Listings.Savings",
+                "Offers.Listings.MerchantInfo",
+                "Offers.Listings.DeliveryInfo.IsPrimeEligible",
+                "Offers.Listings.DeliveryInfo.IsFreeShippingEligible",
+                "Offers.Listings.Availability.Message",
+                "CustomerReviews.Count","CustomerReviews.StarRating"
+            ]
+            for p in range(1, pages+1):
+                cache_key = ("search", q, p)
+                cached = cache_get(cache_key)
+                if cached is None:
+                    raw = search_paapi(q, p, 10, resources)
+                    normalized = [normalize_item(it) for it in raw if normalize_item(it)]
                     cache_set(cache_key, normalized)
                 else:
-                    normalized = data
-            except Exception as e:
-                errors.append(str(e))
-                break
+                    normalized = cached
+                results.extend(normalized)
+                time.sleep(0.2)
+    except Exception as e:
+        errors.append(str(e))
 
-            # filters
-            for p in normalized:
-                if (max_price is not None) and (p["price"] is not None) and (p["price"] > max_price):
-                    continue
-                if prime_only and p["is_prime"] is not True:
-                    continue
-                results.append(p)
-
-            # extra tiny pause between pages
-            time.sleep(0.2)
-
-    ts = datetime.datetime.utcnow().isoformat() + "Z"
-
-    def score(p):
-        r = (p["rating"] or 0.0)
-        v = math.log10((p["review_count"] or 0) + 1.0)
-        price_fit = 0.0
-        if max_price and p["price"]:
-            price_fit = 1.0 - min(1.0, max(0.0, (p["price"]/max_price)))
-        prime_bonus = 0.2 if p.get("is_prime") else 0.0
-        return (r*2.0) + v + price_fit + prime_bonus
-
-    results_sorted = sorted(results, key=score, reverse=True)
+    # apply filters
+    filtered = []
+    for item in results:
+        price = item.get("price")
+        rating = item.get("rating")
+        if min_price is not None and (price is None or price < min_price): continue
+        if max_price is not None and (price is None or price > max_price): continue
+        if min_rating is not None and (rating is None or rating < min_rating): continue
+        if brand and (not item.get("brand") or brand not in item["brand"].lower()): continue
+        if prime_only and item.get("is_prime") is not True: continue
+        filtered.append(item)
 
     payload = {
         "criteria": {
-            "q": q, "provider": provider,
-            "max_price": max_price, "prime_only": prime_only, "pages": pages
+            "q": q, "provider": provider, "pages": pages,
+            "min_price": min_price, "max_price": max_price,
+            "min_rating": min_rating, "brand": brand,
+            "prime_only": prime_only
         },
-        "timestamp": ts,
-        "products": results_sorted
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "products": filtered[:50]   # cap at 50 for performance
     }
     if errors:
         payload["errors"] = errors
 
-    status = 200 if results_sorted else (502 if errors else 200)
-    return jsonify(payload), status
+    return jsonify(payload)
 
 # local run
 if __name__ == "__main__":
