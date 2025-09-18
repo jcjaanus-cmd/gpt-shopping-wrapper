@@ -10,6 +10,7 @@ AMAZON_PARTNER_TAG  = os.getenv("AMAZON_PARTNER_TAG")          # e.g., yourtag-2
 AMAZON_HOST         = os.getenv("AMAZON_HOST", "webservices.amazon.com")
 AMAZON_REGION       = os.getenv("AMAZON_REGION", "us-east-1")
 AMAZON_MARKETPLACE  = os.getenv("AMAZON_MARKETPLACE", "www.amazon.com")
+AMAZON_DOMAIN       = os.getenv("AMAZON_DOMAIN", "amazon.com") # for Rainforest/SerpApi style providers
 
 SERVICE             = "ProductAdvertisingAPI"
 ENDPOINT_SEARCH     = f"https://{AMAZON_HOST}/paapi5/searchitems"
@@ -204,6 +205,61 @@ def search_paapi(keywords, item_page, item_count, resources):
         err = last_resp.text if last_resp is not None else "no response"
     raise RuntimeError(f"PA-API HTTP {last_resp.status_code if last_resp else '???'} after retries: {err}")
 
+# ========= Rainforest (paid search API; no AWS signing) =========
+def _normalize_rainforest_item(r):
+    price = g(r, ["price", "value"])
+    currency = g(r, ["price", "currency"]) or "USD"
+    return {
+        "id": r.get("asin"),
+        "asin": r.get("asin"),
+        "name": r.get("title"),
+        "brand": r.get("brand"),
+        "category": None,
+        "price": float(price) if price is not None else None,
+        "currency": currency,
+        "list_price": None,
+        "savings_amount": None,
+        "savings_percent": None,
+        "rating": g(r, ["rating"]),
+        "review_count": g(r, ["ratings_total"]),
+        "stock_message": None,
+        "is_prime": None,
+        "is_free_shipping": None,
+        "is_fulfilled_by_amazon": None,
+        "delivery_min": None,
+        "delivery_max": None,
+        "features": [],
+        "image": r.get("image"),
+        "images": [],
+        "external_ids": {},
+        "affiliate_url": r.get("link"),
+    }
+
+def search_rainforest(q, page=1, num=10):
+    api_key = os.getenv("RAINFOREST_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing RAINFOREST_API_KEY")
+    domain = AMAZON_DOMAIN
+    r = requests.get(
+        "https://api.rainforestapi.com/request",
+        params={
+            "api_key": api_key,
+            "type": "search",
+            "amazon_domain": domain,
+            "search_term": q,
+            "page": page
+        },
+        timeout=15
+    )
+    r.raise_for_status()
+    data = r.json()
+    items = data.get("search_results") or []
+    out = []
+    for it in items[:num]:
+        norm = _normalize_rainforest_item(it)
+        if norm: out.append(norm)
+    return out
+
 # ========= routes =========
 @app.get("/health")
 def health():
@@ -211,7 +267,8 @@ def health():
         "ok": True,
         "time": datetime.datetime.utcnow().isoformat() + "Z",
         "env_ok": bool(AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG),
-        "host": AMAZON_HOST, "region": AMAZON_REGION, "marketplace": AMAZON_MARKETPLACE
+        "host": AMAZON_HOST, "region": AMAZON_REGION, "marketplace": AMAZON_MARKETPLACE,
+        "has_rainforest_key": bool(os.getenv("RAINFOREST_API_KEY"))
     })
 
 @app.get("/cache-stats")
@@ -231,12 +288,12 @@ def debug_search():
 
 @app.get("/search")
 def search():
-    if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
-        return jsonify({"error":"Missing Amazon credentials env vars"}), 500
-
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"error":"Missing required query param 'q'"}), 400
+
+    # choose provider (default = amazon)
+    provider = (request.args.get("provider") or "amazon").lower()
 
     def _float(name):
         v = request.args.get(name)
@@ -271,31 +328,42 @@ def search():
     results = []
     errors = []
 
-    for page in range(1, pages+1):
-        cache_key = ("search", q, page)
-        data = cache_get(cache_key)
+    if provider == "rainforest":
+        # Rainforest path (no Amazon creds required)
         try:
-            if data is None:
-                raw_items = search_paapi(q, page, 10, resources)
-                # normalize once, then cache
-                normalized = [normalize_item(it) for it in raw_items if normalize_item(it)]
-                cache_set(cache_key, normalized)
-            else:
-                normalized = data
+            results = search_rainforest(q, page=1, num=10)
         except Exception as e:
-            errors.append(str(e))
-            break
+            errors.append(f"rainforest: {e}")
+    else:
+        # Amazon path (requires Amazon env)
+        if not (AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY and AMAZON_PARTNER_TAG):
+            return jsonify({"error":"Missing Amazon credentials env vars"}), 500
 
-        # filters
-        for p in normalized:
-            if (max_price is not None) and (p["price"] is not None) and (p["price"] > max_price):
-                continue
-            if prime_only and p["is_prime"] is not True:
-                continue
-            results.append(p)
+        for page in range(1, pages+1):
+            cache_key = ("search", q, page)
+            data = cache_get(cache_key)
+            try:
+                if data is None:
+                    raw_items = search_paapi(q, page, 10, resources)
+                    # normalize once, then cache
+                    normalized = [normalize_item(it) for it in raw_items if normalize_item(it)]
+                    cache_set(cache_key, normalized)
+                else:
+                    normalized = data
+            except Exception as e:
+                errors.append(str(e))
+                break
 
-        # extra tiny pause between pages
-        time.sleep(0.2)
+            # filters
+            for p in normalized:
+                if (max_price is not None) and (p["price"] is not None) and (p["price"] > max_price):
+                    continue
+                if prime_only and p["is_prime"] is not True:
+                    continue
+                results.append(p)
+
+            # extra tiny pause between pages
+            time.sleep(0.2)
 
     ts = datetime.datetime.utcnow().isoformat() + "Z"
 
@@ -305,13 +373,16 @@ def search():
         price_fit = 0.0
         if max_price and p["price"]:
             price_fit = 1.0 - min(1.0, max(0.0, (p["price"]/max_price)))
-        prime_bonus = 0.2 if p["is_prime"] else 0.0
+        prime_bonus = 0.2 if p.get("is_prime") else 0.0
         return (r*2.0) + v + price_fit + prime_bonus
 
     results_sorted = sorted(results, key=score, reverse=True)
 
     payload = {
-        "criteria": {"q": q, "max_price": max_price, "prime_only": prime_only, "pages": pages},
+        "criteria": {
+            "q": q, "provider": provider,
+            "max_price": max_price, "prime_only": prime_only, "pages": pages
+        },
         "timestamp": ts,
         "products": results_sorted
     }
